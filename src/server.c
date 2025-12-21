@@ -65,7 +65,7 @@ static void do_unsharp_job(job_t *job) {
         }
     }
 
-    float k = 10.0f;
+    float k = 8.0f;
     for (size_t i = 0; i < pixels; ++i) {
         int orig   = in_pixels[i];
         int b      = blur[i];
@@ -416,13 +416,6 @@ int main(int argc, char *argv[]) {
     sa.sa_handler = handle_sigint;
     sigaction(SIGINT, &sa, NULL);
 
-    // 初始化 job 狀態
-    ipc_lock(&g_ipc);
-    for (int i = 0; i < 16; ++i) {
-        STATS->jobs[i].state = JOB_EMPTY;
-    }
-    ipc_unlock(&g_ipc);
-
     int listen_fd = net_listen(ip, port, 128);
     if (listen_fd < 0) {
         LOG_ERROR("net_listen failed");
@@ -430,27 +423,63 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 先 fork 出一個 unsharp process
-    pid_t upid = fork();
-    if (upid == 0) {
+    // 初始化 job 狀態
+    ipc_lock(&g_ipc);
+    for (int i = 0; i < MAX_JOBS; ++i) {
+        STATS->jobs[i].state = JOB_EMPTY;
+    }
+    ipc_unlock(&g_ipc);
+
+    // --- 記錄 child PID ---
+    pid_t unsharp_pid = -1;
+    pid_t *worker_pids = calloc(workers, sizeof(pid_t));
+    if (!worker_pids) {
+        LOG_ERROR("calloc worker_pids failed");
+        close(listen_fd);
+        ipc_destroy(&g_ipc);
+        return 1;
+    }
+
+    // 先 fork 出 unsharp process
+    unsharp_pid = fork();
+    if (unsharp_pid == 0) {
         // child: unsharp
         close(listen_fd);
         unsharp_loop();
         exit(0);
+    } else if (unsharp_pid < 0) {
+        LOG_ERROR("fork unsharp failed");
+        close(listen_fd);
+        free(worker_pids);
+        ipc_destroy(&g_ipc);
+        return 1;
     }
 
-    // master 照舊 fork 多個 worker
+    // 再 fork 多個 worker
     for (int i = 0; i < workers; ++i) {
         pid_t pid = fork();
         if (pid == 0) {
+            // child: worker
             worker_loop(listen_fd);
             close(listen_fd);
             exit(0);
+        } else if (pid < 0) {
+            LOG_ERROR("fork worker %d failed", i);
+            // 簡化處理：master 先繼續跑，少一個 worker
+            worker_pids[i] = -1;
+        } else {
+            worker_pids[i] = pid;
         }
     }
 
-    // master 等 shutdown_flag
+    // master 不用 listen
+    // 如果你想保守一點，也可以保留 listen_fd，但不再 accept
+    // 這裡先保留，等 shutdown 才 close
+    // close(listen_fd); // 如果這樣寫，要在新 fork 的 child 裡重新 net_listen，太麻煩，先不要
+
+    // --- master main loop: 偵測 shutdown_flag + 重生 child ---
     while (1) {
+        // 1) 檢查 shutdown_flag
         ipc_lock(&g_ipc);
         int shutdown = STATS->shutdown_flag;
         ipc_unlock(&g_ipc);
@@ -459,15 +488,76 @@ int main(int argc, char *argv[]) {
             LOG_INFO("master detected shutdown_flag");
             break;
         }
+
+        // 2) 用 waitpid(WNOHANG) 看看有沒有 child 掛掉
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            // 查看是誰掛了
+            if (pid == unsharp_pid) {
+                LOG_WARN("unsharp process %d exited unexpectedly", pid);
+
+                // 如果還沒 shutdown，就重啟 unsharp
+                ipc_lock(&g_ipc);
+                shutdown = STATS->shutdown_flag;
+                ipc_unlock(&g_ipc);
+
+                if (!shutdown) {
+                    pid_t npid = fork();
+                    if (npid == 0) {
+                        close(listen_fd);
+                        unsharp_loop();
+                        exit(0);
+                    } else if (npid > 0) {
+                        unsharp_pid = npid;
+                        LOG_INFO("restarted unsharp process %d", npid);
+                    } else {
+                        LOG_ERROR("fork unsharp (restart) failed");
+                    }
+                }
+            } else {
+                // 看是不是某個 worker
+                for (int i = 0; i < workers; ++i) {
+                    if (worker_pids[i] == pid) {
+                        LOG_WARN("worker %d (pid=%d) exited", i, pid);
+
+                        ipc_lock(&g_ipc);
+                        shutdown = STATS->shutdown_flag;
+                        ipc_unlock(&g_ipc);
+
+                        if (!shutdown) {
+                            // 重啟一個新的 worker
+                            pid_t npid = fork();
+                            if (npid == 0) {
+                                worker_loop(listen_fd);
+                                close(listen_fd);
+                                exit(0);
+                            } else if (npid > 0) {
+                                worker_pids[i] = npid;
+                                LOG_INFO("restarted worker %d (pid=%d)", i, npid);
+                            } else {
+                                LOG_ERROR("fork worker (restart) %d failed", i);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 稍微睡一下，避免 busy loop
         sleep(1);
     }
 
+    // --- 進入 shutdown：不再重生 child，等他們自然結束 ---
     close(listen_fd);
 
-    // 等所有 child 結束（workers + unsharp）
     int status;
-    while (waitpid(-1, &status, 0) > 0) {}
+    while (waitpid(-1, &status, 0) > 0) {
+        // 把所有 child 收乾淨
+    }
 
+    free(worker_pids);
     ipc_destroy(&g_ipc);
     log_close();
     return 0;
