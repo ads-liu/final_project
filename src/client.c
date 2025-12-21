@@ -13,6 +13,7 @@
 #include "net.h"
 #include "proto.h"
 #include "log.h"
+#include "tls.h"
 
 typedef struct {
     long total_requests;
@@ -136,12 +137,23 @@ static int load_pgm(const char *path, pgm_img_t *img) {
 static void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
 
+    /* 1) 先建立 TCP 連線 */
     int fd = net_connect(targ->ip, targ->port);
     if (fd < 0) {
         LOG_ERROR("thread %d connect failed", targ->thread_index);
         return NULL;
     }
-    LOG_INFO("thread %d connected fd=%d", targ->thread_index, fd);
+
+    /* 2) 包成 TLS：使用 server.crt 當 CA，驗證伺服器憑證與主機名 */
+    extern tls_client_t g_tls_client;   // 在 main 裡定義全域 client context
+    tls_ctx_t *t = tls_client_wrap_fd(&g_tls_client, fd, targ->ip);
+    if (!t) {
+        LOG_ERROR("thread %d TLS handshake failed", targ->thread_index);
+        net_close(fd);
+        return NULL;
+    }
+
+    LOG_INFO("thread %d connected fd=%d (TLS)", targ->thread_index, fd);
 
     uint8_t *img_body = targ->img_body;
     size_t body_len = targ->body_len;
@@ -174,15 +186,16 @@ static void *worker_thread(void *arg) {
                  targ->thread_index, i, out_len);
 
         double t1 = now_ms();
-        if (net_write_n(fd, out_buf, out_len) < 0) {
+        if (tls_write_n(t, out_buf, out_len) < 0) {
             LOG_ERROR("write failed");
             free(out_buf);
             break;
         }
 
         uint32_t len_net;
-        if (net_read_n(fd, &len_net, sizeof(len_net)) < 0) {
-            LOG_ERROR("read length failed");
+        int r = tls_read_n(t, &len_net, sizeof(len_net));
+        if (r != 0) {
+            LOG_ERROR("read length failed (r=%d)", r);
             free(out_buf);
             break;
         }
@@ -201,7 +214,7 @@ static void *worker_thread(void *arg) {
             break;
         }
         memcpy(in_buf, &len_net, sizeof(len_net));
-        if (net_read_n(fd, in_buf + sizeof(len_net), remaining) < 0) {
+        if (tls_read_n(t, in_buf + sizeof(len_net), remaining) < 0) {
             LOG_ERROR("read body failed");
             free(out_buf);
             free(in_buf);
@@ -230,7 +243,7 @@ static void *worker_thread(void *arg) {
         }
         pthread_mutex_unlock(&targ->stats->lock);
 
-        /* 每個 thread 第一次成功回應時，把負片存成 img/YYYYMMDD_threadX_lena.pgm */
+        /* 每個 thread 第一次成功回應時，把圖片存成 img/YYYYMMDD_threadX_lena.pgm */
         if (reply.opcode == OPCODE_IMG_RESPONSE && !saved_once) {
             if (reply.body_len >= 8) {
                 uint32_t w_net2, h_net2;
@@ -263,9 +276,12 @@ static void *worker_thread(void *arg) {
         free(in_buf);
     }
 
-    net_close(fd);
+    tls_close(t);  // 會順便 close(fd)
     return NULL;
 }
+
+/* 全域 TLS client context，所有 thread 共用同一個 SSL_CTX */
+tls_client_t g_tls_client;
 
 int main(int argc, char *argv[]) {
     const char *ip = "127.0.0.1";
@@ -279,8 +295,14 @@ int main(int argc, char *argv[]) {
     if (argc > 4) req_per_thread = atoi(argv[4]);
 
     log_init(NULL, LOG_LEVEL_INFO);
-
     ensure_img_dir();  // 確保有 img 資料夾
+
+    /* 初始化 TLS：使用 server.crt 當信任 CA，開啟伺服器憑證驗證 */
+    tls_global_init();
+    if (tls_client_init(&g_tls_client, "server.crt") < 0) {
+        fprintf(stderr, "tls_client_init failed\n");
+        return 1;
+    }
 
     /* 載入 lena.pgm，組成協定 body */
     pgm_img_t lena;
@@ -351,6 +373,9 @@ int main(int argc, char *argv[]) {
     free(tids);
     free(targs);
     free(img_body);
+
+    tls_client_free(&g_tls_client);
+    tls_global_cleanup();
     log_close();
     return 0;
 }

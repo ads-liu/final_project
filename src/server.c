@@ -1,15 +1,19 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 #include "net.h"
 #include "proto.h"
 #include "ipc.h"
 #include "log.h"
+#include "tls.h"
 
 #define SHM_KEY 0x12340001
 #define SEM_KEY 0x12340002
@@ -17,7 +21,10 @@
 static ipc_handle_t g_ipc;
 #define STATS (g_ipc.stats)
 
-#define MAX_IMG_PIXELS (512*512)   // 看你作業要求，必要時放大一點
+#define MAX_IMG_PIXELS (512*512) // 看你作業要求，必要時放大一點
+
+// TLS server context（所有 worker 共用）
+static tls_server_t g_tls_server;
 
 /* ========= signal ========= */
 
@@ -36,8 +43,7 @@ static void do_unsharp_job(job_t *job) {
     uint32_t w = job->width;
     uint32_t h = job->height;
     size_t pixels = job->pixels;
-
-    uint8_t *in_pixels  = job->input;
+    uint8_t *in_pixels = job->input;
     uint8_t *out_pixels = job->output;
 
     uint8_t *blur = (uint8_t *)malloc(pixels);
@@ -67,11 +73,11 @@ static void do_unsharp_job(job_t *job) {
 
     float k = 8.0f;
     for (size_t i = 0; i < pixels; ++i) {
-        int orig   = in_pixels[i];
-        int b      = blur[i];
+        int orig = in_pixels[i];
+        int b = blur[i];
         int detail = orig - b;
-        int val    = (int)(orig + k * detail);
-        if (val < 0)   val = 0;
+        int val = (int)(orig + k * detail);
+        if (val < 0) val = 0;
         if (val > 255) val = 255;
         out_pixels[i] = (uint8_t)val;
     }
@@ -90,7 +96,7 @@ static void unsharp_loop(void) {
         }
 
         int found = 0;
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < MAX_JOBS; ++i) {
             job_t *job = &STATS->jobs[i];
             if (job->state == JOB_READY) {
                 // 把狀態先改成暫時值，避免其他 worker 搶
@@ -136,7 +142,7 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
         }
 
         int slot = -1;
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < MAX_JOBS; ++i) {
             if (STATS->jobs[i].state == JOB_EMPTY) {
                 slot = i;
                 break;
@@ -145,7 +151,7 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
 
         if (slot >= 0) {
             job_t *job = &STATS->jobs[slot];
-            job->width  = w;
+            job->width = w;
             job->height = h;
             job->pixels = pixels;
             memcpy(job->input, in_pixels, pixels);
@@ -171,17 +177,18 @@ static int wait_unsharp_and_build_reply(job_t *job,
             ipc_unlock(&g_ipc);
             return -1;
         }
+
         if (job->state == JOB_DONE) {
             ipc_unlock(&g_ipc);
             break;
         }
+
         ipc_unlock(&g_ipc);
         usleep(1000);
     }
 
     size_t pixels = job->pixels;
     size_t body_len = 8 + pixels;
-
     uint8_t *out_body = (uint8_t *)malloc(body_len);
     if (!out_body) {
         return -1;
@@ -195,12 +202,11 @@ static int wait_unsharp_and_build_reply(job_t *job,
     job->state = JOB_EMPTY;
     ipc_unlock(&g_ipc);
 
-    reply->opcode   = OPCODE_IMG_RESPONSE;
-    reply->flags    = 0;
+    reply->opcode = OPCODE_IMG_RESPONSE;
+    reply->flags = 0;
     reply->reserved = 0;
-    reply->body     = out_body;
+    reply->body = out_body;
     reply->body_len = body_len;
-
     return 0;
 }
 
@@ -210,11 +216,11 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
 
     if (req->body_len < 8) {
         const char *err = "invalid img body";
-        reply->opcode   = OPCODE_ERROR;
-        reply->flags    = 0;
+        reply->opcode = OPCODE_ERROR;
+        reply->flags = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body     = (uint8_t *)malloc(reply->body_len);
+        reply->body = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
@@ -225,57 +231,56 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
     uint32_t w = ntohl(w_net);
     uint32_t h = ntohl(h_net);
     size_t pixels = (size_t)w * (size_t)h;
-
     if (req->body_len != 8 + pixels || pixels > MAX_IMG_PIXELS) {
         const char *err = "size mismatch";
-        reply->opcode   = OPCODE_ERROR;
-        reply->flags    = 0;
+        reply->opcode = OPCODE_ERROR;
+        reply->flags = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body     = (uint8_t *)malloc(reply->body_len);
+        reply->body = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
 
     uint8_t *in_pixels = req->body + 8;
-
     job_t *job = NULL;
     if (submit_unsharp_job(w, h, in_pixels, &job) < 0) {
         const char *err = "job submit failed";
-        reply->opcode   = OPCODE_ERROR;
-        reply->flags    = 0;
+        reply->opcode = OPCODE_ERROR;
+        reply->flags = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body     = (uint8_t *)malloc(reply->body_len);
+        reply->body = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
 
     if (wait_unsharp_and_build_reply(job, req, reply) < 0) {
         const char *err = "job wait failed";
-        reply->opcode   = OPCODE_ERROR;
-        reply->flags    = 0;
+        reply->opcode = OPCODE_ERROR;
+        reply->flags = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body     = (uint8_t *)malloc(reply->body_len);
+        reply->body = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
 }
 
-/* ========= handle_connection / worker_loop 幾乎維持原樣 ========= */
+/* ========= handle_connection / worker_loop (TLS 版) ========= */
 
-static void handle_connection(int conn_fd) {
-    LOG_INFO("handle_connection start fd=%d", conn_fd);
+static void handle_connection(tls_ctx_t *t) {
+    if (!t) return;
+    LOG_INFO("handle_connection start fd=%d", t->fd);
 
     for (;;) {
         uint32_t len_net;
-        int r = net_read_n(conn_fd, &len_net, sizeof(len_net));
+        int r = tls_read_n(t, &len_net, sizeof(len_net));
         if (r != 0) {
             if (r == 1) {
-                LOG_INFO("client closed connection fd=%d", conn_fd);
+                LOG_INFO("client closed connection fd=%d", t->fd);
             } else {
-                LOG_WARN("server read length failed fd=%d", conn_fd);
+                LOG_WARN("server read length failed fd=%d", t->fd);
             }
             break;
         }
@@ -292,8 +297,9 @@ static void handle_connection(int conn_fd) {
             LOG_ERROR("malloc failed");
             break;
         }
+
         memcpy(buf, &len_net, sizeof(len_net));
-        if (net_read_n(conn_fd, buf + sizeof(len_net), remaining) < 0) {
+        if (tls_read_n(t, buf + sizeof(len_net), remaining) < 0) {
             LOG_WARN("server read body failed");
             free(buf);
             break;
@@ -320,18 +326,18 @@ static void handle_connection(int conn_fd) {
         if (msg.opcode == OPCODE_IMG_REQUEST) {
             process_image_request(&msg, &reply);
         } else if (msg.opcode == OPCODE_HEARTBEAT) {
-            reply.opcode   = OPCODE_HEARTBEAT;
-            reply.flags    = 0;
+            reply.opcode = OPCODE_HEARTBEAT;
+            reply.flags = 0;
             reply.reserved = 0;
-            reply.body     = NULL;
+            reply.body = NULL;
             reply.body_len = 0;
         } else {
             const char *err = "unknown opcode";
-            reply.opcode   = OPCODE_ERROR;
-            reply.flags    = 0;
+            reply.opcode = OPCODE_ERROR;
+            reply.flags = 0;
             reply.reserved = 0;
             reply.body_len = strlen(err);
-            reply.body     = (uint8_t *)malloc(reply.body_len);
+            reply.body = (uint8_t *)malloc(reply.body_len);
             if (reply.body) memcpy(reply.body, err, reply.body_len);
         }
 
@@ -344,7 +350,7 @@ static void handle_connection(int conn_fd) {
             break;
         }
 
-        if (net_write_n(conn_fd, out_buf, out_len) < 0) {
+        if (tls_write_n(t, out_buf, out_len) < 0) {
             LOG_WARN("server write failed, out_len=%zu", out_len);
             free(out_buf);
             proto_free(&msg);
@@ -362,8 +368,8 @@ static void handle_connection(int conn_fd) {
         proto_free(&reply);
     }
 
-    net_close(conn_fd);
-    LOG_INFO("handle_connection end fd=%d", conn_fd);
+    tls_close(t);
+    LOG_INFO("handle_connection end fd=%d", t->fd);
 }
 
 static void worker_loop(int listen_fd) {
@@ -387,19 +393,28 @@ static void worker_loop(int listen_fd) {
             continue;
         }
 
-        LOG_INFO("worker %d accepted connection", getpid());
-        handle_connection(conn_fd);
+        LOG_INFO("worker %d accepted connection fd=%d", getpid(), conn_fd);
+
+        // 這裡包 TLS：共用全域的 g_tls_server context
+        tls_ctx_t *t = tls_server_wrap_fd(&g_tls_server, conn_fd);
+        if (!t) {
+            LOG_WARN("tls_server_wrap_fd failed fd=%d", conn_fd);
+            net_close(conn_fd); // TLS 失敗時直接關 TCP
+            continue;
+        }
+
+        handle_connection(t);
     }
 
     LOG_INFO("worker %d exit", getpid());
 }
 
-/* ========= main：多一個 unsharp process ========= */
+/* ========= main：多一個 unsharp process + TLS 初始化 ========= */
 
 int main(int argc, char *argv[]) {
     const char *ip = NULL;
     uint16_t port = 9000;
-    int workers = 4;
+    int workers = 3;
 
     if (argc > 1) port = (uint16_t)atoi(argv[1]);
     if (argc > 2) workers = atoi(argv[2]);
@@ -411,6 +426,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // 初始化 OpenSSL & TLS server context
+    tls_global_init();
+    if (tls_server_init(&g_tls_server, "server.crt", "server.key") < 0) {
+        LOG_ERROR("tls_server_init failed");
+        ipc_destroy(&g_ipc);
+        return 1;
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sigint;
@@ -419,6 +442,7 @@ int main(int argc, char *argv[]) {
     int listen_fd = net_listen(ip, port, 128);
     if (listen_fd < 0) {
         LOG_ERROR("net_listen failed");
+        tls_server_free(&g_tls_server);
         ipc_destroy(&g_ipc);
         return 1;
     }
@@ -436,6 +460,7 @@ int main(int argc, char *argv[]) {
     if (!worker_pids) {
         LOG_ERROR("calloc worker_pids failed");
         close(listen_fd);
+        tls_server_free(&g_tls_server);
         ipc_destroy(&g_ipc);
         return 1;
     }
@@ -451,6 +476,7 @@ int main(int argc, char *argv[]) {
         LOG_ERROR("fork unsharp failed");
         close(listen_fd);
         free(worker_pids);
+        tls_server_free(&g_tls_server);
         ipc_destroy(&g_ipc);
         return 1;
     }
@@ -472,18 +498,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // master 不用 listen
-    // 如果你想保守一點，也可以保留 listen_fd，但不再 accept
-    // 這裡先保留，等 shutdown 才 close
-    // close(listen_fd); // 如果這樣寫，要在新 fork 的 child 裡重新 net_listen，太麻煩，先不要
-
+    // master 不用 listen 的 accept，但保留 listen_fd 給子行程用
     // --- master main loop: 偵測 shutdown_flag + 重生 child ---
     while (1) {
         // 1) 檢查 shutdown_flag
         ipc_lock(&g_ipc);
         int shutdown = STATS->shutdown_flag;
         ipc_unlock(&g_ipc);
-
         if (shutdown) {
             LOG_INFO("master detected shutdown_flag");
             break;
@@ -496,12 +517,10 @@ int main(int argc, char *argv[]) {
             // 查看是誰掛了
             if (pid == unsharp_pid) {
                 LOG_WARN("unsharp process %d exited unexpectedly", pid);
-
                 // 如果還沒 shutdown，就重啟 unsharp
                 ipc_lock(&g_ipc);
                 shutdown = STATS->shutdown_flag;
                 ipc_unlock(&g_ipc);
-
                 if (!shutdown) {
                     pid_t npid = fork();
                     if (npid == 0) {
@@ -520,11 +539,9 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < workers; ++i) {
                     if (worker_pids[i] == pid) {
                         LOG_WARN("worker %d (pid=%d) exited", i, pid);
-
                         ipc_lock(&g_ipc);
                         shutdown = STATS->shutdown_flag;
                         ipc_unlock(&g_ipc);
-
                         if (!shutdown) {
                             // 重啟一個新的 worker
                             pid_t npid = fork();
@@ -551,13 +568,14 @@ int main(int argc, char *argv[]) {
 
     // --- 進入 shutdown：不再重生 child，等他們自然結束 ---
     close(listen_fd);
-
-    int status;
-    while (waitpid(-1, &status, 0) > 0) {
+    int status2;
+    while (waitpid(-1, &status2, 0) > 0) {
         // 把所有 child 收乾淨
     }
 
     free(worker_pids);
+    tls_server_free(&g_tls_server);
+    tls_global_cleanup();
     ipc_destroy(&g_ipc);
     log_close();
     return 0;
