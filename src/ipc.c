@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/sem.h>
 #include <unistd.h>
@@ -27,9 +26,9 @@ int ipc_create(ipc_handle_t *handle, key_t shm_key, key_t sem_key) {
     if (!handle) return -1;
     memset(handle, 0, sizeof(*handle));
 
-    int shm_id = shmget(shm_key, sizeof(ipc_server_stats_t), IPC_CREAT | IPC_EXCL | 0666);
+    int shm_id = shmget(shm_key, sizeof(ipc_server_stats_t),
+                        IPC_CREAT | IPC_EXCL | 0666);
     if (shm_id == -1) {
-        // 若已存在可以改用 attach，但這裡先簡單當錯誤
         return -1;
     }
 

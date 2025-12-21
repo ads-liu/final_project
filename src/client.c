@@ -270,7 +270,7 @@ static void *worker_thread(void *arg) {
 int main(int argc, char *argv[]) {
     const char *ip = "127.0.0.1";
     uint16_t port = 9000;
-    int threads = 4;
+    int threads = 1;
     int req_per_thread = 1;  // 一個 thread 送幾次，可自行調整
 
     if (argc > 1) ip = argv[1];

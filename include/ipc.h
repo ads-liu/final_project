@@ -2,8 +2,8 @@
 #define IPC_H
 
 #include <stdint.h>
-#include <sys/types.h>  // 這行一定要有，提供 key_t
-#include <sys/ipc.h>    // 建議一起 include，對 SysV IPC 友善
+#include <sys/types.h>
+#include <sys/ipc.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,12 +21,12 @@ typedef enum {
 } job_state_t;
 
 typedef struct {
-    int   client_fd;
-    uint32_t width;
-    uint32_t height;
-    uint8_t input[IMG_PIXELS];
-    uint8_t output[IMG_PIXELS];
     job_state_t state;
+    uint32_t    width;
+    uint32_t    height;
+    size_t      pixels;              // 方便 unsharp 用
+    uint8_t     input[IMG_PIXELS];
+    uint8_t     output[IMG_PIXELS];
 } job_t;
 
 typedef struct {
@@ -35,7 +35,7 @@ typedef struct {
     uint64_t total_bytes_out;
     uint32_t active_connections;
     uint32_t shutdown_flag;
-    job_t jobs[MAX_JOBS];
+    job_t    jobs[MAX_JOBS];
 } ipc_server_stats_t;
 
 typedef struct {
@@ -44,12 +44,12 @@ typedef struct {
     ipc_server_stats_t *stats;
 } ipc_handle_t;
 
-int ipc_create(ipc_handle_t *handle, key_t shm_key, key_t sem_key);
-int ipc_attach(ipc_handle_t *handle, key_t shm_key, key_t sem_key);
-int ipc_detach(ipc_handle_t *handle);
+int ipc_create (ipc_handle_t *handle, key_t shm_key, key_t sem_key);
+int ipc_attach (ipc_handle_t *handle, key_t shm_key, key_t sem_key);
+int ipc_detach (ipc_handle_t *handle);
 int ipc_destroy(ipc_handle_t *handle);
-int ipc_lock(ipc_handle_t *handle);
-int ipc_unlock(ipc_handle_t *handle);
+int ipc_lock   (ipc_handle_t *handle);
+int ipc_unlock (ipc_handle_t *handle);
 
 #ifdef __cplusplus
 }

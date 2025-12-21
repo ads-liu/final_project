@@ -15,81 +15,35 @@
 #define SEM_KEY 0x12340002
 
 static ipc_handle_t g_ipc;
+#define STATS (g_ipc.stats)
+
+#define MAX_IMG_PIXELS (512*512)   // 看你作業要求，必要時放大一點
+
+/* ========= signal ========= */
 
 static void handle_sigint(int signo) {
     (void)signo;
     if (g_ipc.stats) {
         ipc_lock(&g_ipc);
-        g_ipc.stats->shutdown_flag = 1;
+        STATS->shutdown_flag = 1;
         ipc_unlock(&g_ipc);
     }
 }
 
-// 主功能：處理 image request
-// body 格式: [w(4)][h(4)][pixels...], 灰階 8-bit
-static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
-    if (!req || !reply) return;
+/* ========= Unsharp process 在 shared memory 上處理 job ========= */
 
-    if (req->body_len < 8) {
-        const char *err = "invalid img body";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags  = 0;
-        reply->reserved = 0;
-        reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
-        if (reply->body) memcpy(reply->body, err, reply->body_len);
-        return;
-    }
+static void do_unsharp_job(job_t *job) {
+    uint32_t w = job->width;
+    uint32_t h = job->height;
+    size_t pixels = job->pixels;
 
-    uint32_t w_net, h_net;
-    memcpy(&w_net, req->body + 0, 4);
-    memcpy(&h_net, req->body + 4, 4);
-    uint32_t w = ntohl(w_net);
-    uint32_t h = ntohl(h_net);
-    size_t pixels = (size_t)w * (size_t)h;
+    uint8_t *in_pixels  = job->input;
+    uint8_t *out_pixels = job->output;
 
-    if (req->body_len != 8 + pixels) {
-        const char *err = "size mismatch";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags  = 0;
-        reply->reserved = 0;
-        reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
-        if (reply->body) memcpy(reply->body, err, reply->body_len);
-        return;
-    }
-
-    uint8_t *out_body = (uint8_t *)malloc(req->body_len);
-    if (!out_body) {
-        const char *err = "oom";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags  = 0;
-        reply->reserved = 0;
-        reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
-        if (reply->body) memcpy(reply->body, err, reply->body_len);
-        return;
-    }
-
-    // 複製 width/height
-    memcpy(out_body, req->body, 8);
-
-    uint8_t *in_pixels  = req->body + 8;
-    uint8_t *out_pixels = out_body + 8;
-
-    /* --------- Unsharp Mask 開始：I_sharp = I + k*(I - blur(I)) --------- */
-
-    // 1. 先做一張模糊圖（3x3 box blur）
     uint8_t *blur = (uint8_t *)malloc(pixels);
     if (!blur) {
-        free(out_body);
-        const char *err = "oom";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags  = 0;
-        reply->reserved = 0;
-        reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
-        if (reply->body) memcpy(reply->body, err, reply->body_len);
+        // 失敗就原樣 copy 回去
+        memcpy(out_pixels, in_pixels, pixels);
         return;
     }
 
@@ -111,8 +65,7 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
         }
     }
 
-    // 2. Unsharp: I_sharp = I + k*(I - B)
-    float k = 10.0f; // 銳化強度，可調整
+    float k = 10.0f;
     for (size_t i = 0; i < pixels; ++i) {
         int orig   = in_pixels[i];
         int b      = blur[i];
@@ -120,32 +73,215 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
         int val    = (int)(orig + k * detail);
         if (val < 0)   val = 0;
         if (val > 255) val = 255;
-        out_pixels[i]  = (uint8_t)val;
+        out_pixels[i] = (uint8_t)val;
     }
 
     free(blur);
+}
 
-    /* --------- Unsharp Mask 結束 --------- */
+static void unsharp_loop(void) {
+    LOG_INFO("unsharp process %d started", getpid());
+
+    while (1) {
+        ipc_lock(&g_ipc);
+        if (STATS->shutdown_flag) {
+            ipc_unlock(&g_ipc);
+            break;
+        }
+
+        int found = 0;
+        for (int i = 0; i < 16; ++i) {
+            job_t *job = &STATS->jobs[i];
+            if (job->state == JOB_READY) {
+                // 把狀態先改成暫時值，避免其他 worker 搶
+                job->state = JOB_EMPTY + 3; // TEMP_BUSY
+                ipc_unlock(&g_ipc);
+
+                do_unsharp_job(job);
+
+                ipc_lock(&g_ipc);
+                job->state = JOB_DONE;
+                ipc_unlock(&g_ipc);
+
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            ipc_unlock(&g_ipc);
+            usleep(1000); // 沒 job 就小睡一下
+        }
+    }
+
+    LOG_INFO("unsharp process %d exit", getpid());
+}
+
+/* ========= worker 端：丟 job 給 unsharp process ========= */
+
+// body: [w(4)][h(4)][pixels...]
+static int submit_unsharp_job(uint32_t w, uint32_t h,
+                              const uint8_t *in_pixels,
+                              job_t **ret_job) {
+    size_t pixels = (size_t)w * (size_t)h;
+    if (pixels > MAX_IMG_PIXELS) {
+        return -1;
+    }
+
+    while (1) {
+        ipc_lock(&g_ipc);
+        if (STATS->shutdown_flag) {
+            ipc_unlock(&g_ipc);
+            return -1;
+        }
+
+        int slot = -1;
+        for (int i = 0; i < 16; ++i) {
+            if (STATS->jobs[i].state == JOB_EMPTY) {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot >= 0) {
+            job_t *job = &STATS->jobs[slot];
+            job->width  = w;
+            job->height = h;
+            job->pixels = pixels;
+            memcpy(job->input, in_pixels, pixels);
+            job->state = JOB_READY;
+            *ret_job = job;
+            ipc_unlock(&g_ipc);
+            return 0;
+        }
+
+        ipc_unlock(&g_ipc);
+        // 沒空 slot 就等一下再試
+        usleep(1000);
+    }
+}
+
+// 等 job 變 DONE，然後把 output copy 到 reply body (含 w,h header)
+static int wait_unsharp_and_build_reply(job_t *job,
+                                        const proto_msg_t *req,
+                                        proto_msg_t *reply) {
+    while (1) {
+        ipc_lock(&g_ipc);
+        if (STATS->shutdown_flag) {
+            ipc_unlock(&g_ipc);
+            return -1;
+        }
+        if (job->state == JOB_DONE) {
+            ipc_unlock(&g_ipc);
+            break;
+        }
+        ipc_unlock(&g_ipc);
+        usleep(1000);
+    }
+
+    size_t pixels = job->pixels;
+    size_t body_len = 8 + pixels;
+
+    uint8_t *out_body = (uint8_t *)malloc(body_len);
+    if (!out_body) {
+        return -1;
+    }
+
+    // 複製原本的 w,h
+    memcpy(out_body, req->body, 8);
+    memcpy(out_body + 8, job->output, pixels);
+
+    ipc_lock(&g_ipc);
+    job->state = JOB_EMPTY;
+    ipc_unlock(&g_ipc);
 
     reply->opcode   = OPCODE_IMG_RESPONSE;
     reply->flags    = 0;
     reply->reserved = 0;
     reply->body     = out_body;
-    reply->body_len = req->body_len;
+    reply->body_len = body_len;
+
+    return 0;
 }
+
+// 解析 body，丟 job 給 unsharp，再拿回結果
+static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
+    if (!req || !reply) return;
+
+    if (req->body_len < 8) {
+        const char *err = "invalid img body";
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
+        reply->reserved = 0;
+        reply->body_len = strlen(err);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
+        if (reply->body) memcpy(reply->body, err, reply->body_len);
+        return;
+    }
+
+    uint32_t w_net, h_net;
+    memcpy(&w_net, req->body + 0, 4);
+    memcpy(&h_net, req->body + 4, 4);
+    uint32_t w = ntohl(w_net);
+    uint32_t h = ntohl(h_net);
+    size_t pixels = (size_t)w * (size_t)h;
+
+    if (req->body_len != 8 + pixels || pixels > MAX_IMG_PIXELS) {
+        const char *err = "size mismatch";
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
+        reply->reserved = 0;
+        reply->body_len = strlen(err);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
+        if (reply->body) memcpy(reply->body, err, reply->body_len);
+        return;
+    }
+
+    uint8_t *in_pixels = req->body + 8;
+
+    job_t *job = NULL;
+    if (submit_unsharp_job(w, h, in_pixels, &job) < 0) {
+        const char *err = "job submit failed";
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
+        reply->reserved = 0;
+        reply->body_len = strlen(err);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
+        if (reply->body) memcpy(reply->body, err, reply->body_len);
+        return;
+    }
+
+    if (wait_unsharp_and_build_reply(job, req, reply) < 0) {
+        const char *err = "job wait failed";
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
+        reply->reserved = 0;
+        reply->body_len = strlen(err);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
+        if (reply->body) memcpy(reply->body, err, reply->body_len);
+        return;
+    }
+}
+
+/* ========= handle_connection / worker_loop 幾乎維持原樣 ========= */
 
 static void handle_connection(int conn_fd) {
     LOG_INFO("handle_connection start fd=%d", conn_fd);
 
     for (;;) {
         uint32_t len_net;
-        if (net_read_n(conn_fd, &len_net, sizeof(len_net)) < 0) {
-            LOG_WARN("server read length failed");
+        int r = net_read_n(conn_fd, &len_net, sizeof(len_net));
+        if (r != 0) {
+            if (r == 1) {
+                LOG_INFO("client closed connection fd=%d", conn_fd);
+            } else {
+                LOG_WARN("server read length failed fd=%d", conn_fd);
+            }
             break;
         }
 
         uint32_t total_len = ntohl(len_net);
-        if (total_len < PROTO_HEADER_LEN || total_len > (10 * 1024 * 1024)) {
+        if (total_len < PROTO_HEADER_LEN) {
             LOG_WARN("invalid packet length %u", total_len);
             break;
         }
@@ -174,8 +310,8 @@ static void handle_connection(int conn_fd) {
         LOG_INFO("server got opcode=0x%04x body_len=%zu", msg.opcode, msg.body_len);
 
         ipc_lock(&g_ipc);
-        g_ipc.stats->total_requests++;
-        g_ipc.stats->total_bytes_in += msg.body_len;
+        STATS->total_requests++;
+        STATS->total_bytes_in += msg.body_len;
         ipc_unlock(&g_ipc);
 
         proto_msg_t reply;
@@ -219,7 +355,7 @@ static void handle_connection(int conn_fd) {
         free(out_buf);
 
         ipc_lock(&g_ipc);
-        g_ipc.stats->total_bytes_out += reply.body_len;
+        STATS->total_bytes_out += reply.body_len;
         ipc_unlock(&g_ipc);
 
         proto_free(&msg);
@@ -234,14 +370,20 @@ static void worker_loop(int listen_fd) {
     LOG_INFO("worker %d started", getpid());
 
     for (;;) {
-        if (g_ipc.stats && g_ipc.stats->shutdown_flag) {
+        ipc_lock(&g_ipc);
+        int shutdown = STATS->shutdown_flag;
+        ipc_unlock(&g_ipc);
+        if (shutdown) {
             LOG_INFO("worker %d detected shutdown_flag", getpid());
             break;
         }
 
         int conn_fd = net_accept(listen_fd);
         if (conn_fd < 0) {
-            if (g_ipc.stats && g_ipc.stats->shutdown_flag) break;
+            ipc_lock(&g_ipc);
+            shutdown = STATS->shutdown_flag;
+            ipc_unlock(&g_ipc);
+            if (shutdown) break;
             continue;
         }
 
@@ -251,6 +393,8 @@ static void worker_loop(int listen_fd) {
 
     LOG_INFO("worker %d exit", getpid());
 }
+
+/* ========= main：多一個 unsharp process ========= */
 
 int main(int argc, char *argv[]) {
     const char *ip = NULL;
@@ -272,6 +416,13 @@ int main(int argc, char *argv[]) {
     sa.sa_handler = handle_sigint;
     sigaction(SIGINT, &sa, NULL);
 
+    // 初始化 job 狀態
+    ipc_lock(&g_ipc);
+    for (int i = 0; i < 16; ++i) {
+        STATS->jobs[i].state = JOB_EMPTY;
+    }
+    ipc_unlock(&g_ipc);
+
     int listen_fd = net_listen(ip, port, 128);
     if (listen_fd < 0) {
         LOG_ERROR("net_listen failed");
@@ -279,6 +430,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // 先 fork 出一個 unsharp process
+    pid_t upid = fork();
+    if (upid == 0) {
+        // child: unsharp
+        close(listen_fd);
+        unsharp_loop();
+        exit(0);
+    }
+
+    // master 照舊 fork 多個 worker
     for (int i = 0; i < workers; ++i) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -288,8 +449,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    for (;;) {
-        if (g_ipc.stats && g_ipc.stats->shutdown_flag) {
+    // master 等 shutdown_flag
+    while (1) {
+        ipc_lock(&g_ipc);
+        int shutdown = STATS->shutdown_flag;
+        ipc_unlock(&g_ipc);
+
+        if (shutdown) {
             LOG_INFO("master detected shutdown_flag");
             break;
         }
@@ -298,6 +464,7 @@ int main(int argc, char *argv[]) {
 
     close(listen_fd);
 
+    // 等所有 child 結束（workers + unsharp）
     int status;
     while (waitpid(-1, &status, 0) > 0) {}
 
