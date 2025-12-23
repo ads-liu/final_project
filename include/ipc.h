@@ -44,7 +44,6 @@ typedef struct {
 } ipc_handle_t;
 
 int ipc_create (ipc_handle_t *handle, key_t shm_key, key_t sem_key);
-int ipc_attach (ipc_handle_t *handle, key_t shm_key, key_t sem_key);
 int ipc_detach (ipc_handle_t *handle);
 int ipc_destroy(ipc_handle_t *handle);
 int ipc_lock   (ipc_handle_t *handle);

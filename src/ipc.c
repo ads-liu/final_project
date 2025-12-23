@@ -103,45 +103,6 @@ int ipc_create(ipc_handle_t *handle, key_t shm_key, key_t sem_key) {
 }
 
 /*
- * Attach to existing shared memory and semaphore.
- *
- * This is typically used by client processes which only need to access
- * the shared statistics (and the same semaphore for synchronization),
- * assuming the server already created both IPC objects.
- *
- * Parameters:
- *   handle  - Output handle that stores shm_id, sem_id, and stats pointer.
- *   shm_key - Key used by the server for the shared memory.
- *   sem_key - Key used by the server for the semaphore set.
- *
- * Return:
- *   0  on success
- *  -1  on failure (for example, resources do not exist yet)
- */
-int ipc_attach(ipc_handle_t *handle, key_t shm_key, key_t sem_key) {
-    if (!handle) return -1;
-    memset(handle, 0, sizeof(*handle));
-
-    // Look up the existing shared memory segment
-    int shm_id = shmget(shm_key, sizeof(ipc_server_stats_t), 0666);
-    if (shm_id == -1) return -1;
-
-    // Look up the existing semaphore set
-    int sem_id = semget(sem_key, 1, 0666);
-    if (sem_id == -1) return -1;
-
-    // Attach shared memory into this process
-    void *addr = shmat(shm_id, NULL, 0);
-    if (addr == (void *)-1) return -1;
-
-    handle->shm_id = shm_id;
-    handle->sem_id = sem_id;
-    handle->stats  = (ipc_server_stats_t *)addr;
-
-    return 0;
-}
-
-/*
  * Detach the shared memory from the current process.
  *
  * Note:
