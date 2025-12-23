@@ -21,12 +21,12 @@
 static ipc_handle_t g_ipc;
 #define STATS (g_ipc.stats)
 
-#define MAX_IMG_PIXELS (512*512) // 看你作業要求，必要時放大一點
+#define MAX_IMG_PIXELS (512*512)
 
-// TLS server context（所有 worker 共用）
+// TLS server context (shared by all workers)
 static tls_server_t g_tls_server;
 
-/* ========= signal ========= */
+/* ========= signal handling ========= */
 
 static void handle_sigint(int signo) {
     (void)signo;
@@ -37,7 +37,7 @@ static void handle_sigint(int signo) {
     }
 }
 
-/* ========= Unsharp process 在 shared memory 上處理 job ========= */
+/* ========= Unsharp process: process jobs in shared memory ========= */
 
 static void do_unsharp_job(job_t *job) {
     uint32_t w = job->width;
@@ -48,11 +48,11 @@ static void do_unsharp_job(job_t *job) {
 
     uint8_t *blur = (uint8_t *)malloc(pixels);
     if (!blur) {
-        // 失敗就原樣 copy 回去
         memcpy(out_pixels, in_pixels, pixels);
         return;
     }
 
+    // Simple 3x3 box blur
     for (uint32_t y = 0; y < h; ++y) {
         for (uint32_t x = 0; x < w; ++x) {
             int sum = 0;
@@ -71,6 +71,7 @@ static void do_unsharp_job(job_t *job) {
         }
     }
 
+    // Unsharp mask: output = orig + k * (orig - blur)
     float k = 8.0f;
     for (size_t i = 0; i < pixels; ++i) {
         int orig = in_pixels[i];
@@ -86,7 +87,8 @@ static void do_unsharp_job(job_t *job) {
 }
 
 static void unsharp_loop(void) {
-    LOG_INFO("unsharp process %d started", getpid());
+    pid_t mypid = getpid();
+    LOG_INFO("unsharp process %d started", mypid);
 
     while (1) {
         ipc_lock(&g_ipc);
@@ -96,34 +98,40 @@ static void unsharp_loop(void) {
         }
 
         int found = 0;
+        job_t *job = NULL;
+
+        // 找 READY job，改成 BUSY 並填 owner_pid
         for (int i = 0; i < MAX_JOBS; ++i) {
-            job_t *job = &STATS->jobs[i];
-            if (job->state == JOB_READY) {
-                // 把狀態先改成暫時值，避免其他 worker 搶
-                job->state = JOB_EMPTY + 3; // TEMP_BUSY
-                ipc_unlock(&g_ipc);
-
-                do_unsharp_job(job);
-
-                ipc_lock(&g_ipc);
-                job->state = JOB_DONE;
-                ipc_unlock(&g_ipc);
-
+            job_t *j = &STATS->jobs[i];
+            if (j->state == JOB_READY) {
+                j->state     = JOB_BUSY;   // *** 修改點：明確用 JOB_BUSY
+                j->owner_pid = mypid;      // *** 修改點：記錄是哪一隻 unsharp 在算
+                job = j;
                 found = 1;
                 break;
             }
         }
+        ipc_unlock(&g_ipc);
 
         if (!found) {
-            ipc_unlock(&g_ipc);
-            usleep(1000); // 沒 job 就小睡一下
+            usleep(1000);
+            continue;
         }
+
+        // 真正做 unsharp
+        do_unsharp_job(job);
+
+        // 寫回 DONE
+        ipc_lock(&g_ipc);
+        job->state = JOB_DONE;
+        // job->owner_pid 可留著做 debug，需要也可以清成 0
+        ipc_unlock(&g_ipc);
     }
 
-    LOG_INFO("unsharp process %d exit", getpid());
+    LOG_INFO("unsharp process %d exit", mypid);
 }
 
-/* ========= worker 端：丟 job 給 unsharp process ========= */
+/* ========= Worker side: submit jobs to unsharp process ========= */
 
 // body: [w(4)][h(4)][pixels...]
 static int submit_unsharp_job(uint32_t w, uint32_t h,
@@ -151,23 +159,23 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
 
         if (slot >= 0) {
             job_t *job = &STATS->jobs[slot];
-            job->width = w;
+            job->width  = w;
             job->height = h;
             job->pixels = pixels;
             memcpy(job->input, in_pixels, pixels);
-            job->state = JOB_READY;
+            job->state     = JOB_READY;
+            job->owner_pid = 0;   // *** 建議：提交時先清為 0
             *ret_job = job;
             ipc_unlock(&g_ipc);
             return 0;
         }
 
         ipc_unlock(&g_ipc);
-        // 沒空 slot 就等一下再試
         usleep(1000);
     }
 }
 
-// 等 job 變 DONE，然後把 output copy 到 reply body (含 w,h header)
+// Wait for job to become DONE, then copy output to reply body (including w,h header)
 static int wait_unsharp_and_build_reply(job_t *job,
                                         const proto_msg_t *req,
                                         proto_msg_t *reply) {
@@ -194,33 +202,33 @@ static int wait_unsharp_and_build_reply(job_t *job,
         return -1;
     }
 
-    // 複製原本的 w,h
     memcpy(out_body, req->body, 8);
     memcpy(out_body + 8, job->output, pixels);
 
     ipc_lock(&g_ipc);
-    job->state = JOB_EMPTY;
+    job->state     = JOB_EMPTY;
+    job->owner_pid = 0;   // *** 清 owner
     ipc_unlock(&g_ipc);
 
-    reply->opcode = OPCODE_IMG_RESPONSE;
-    reply->flags = 0;
+    reply->opcode   = OPCODE_IMG_RESPONSE;
+    reply->flags    = 0;
     reply->reserved = 0;
-    reply->body = out_body;
+    reply->body     = out_body;
     reply->body_len = body_len;
     return 0;
 }
 
-// 解析 body，丟 job 給 unsharp，再拿回結果
+// Parse body, submit job to unsharp process, then fetch the result
 static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
     if (!req || !reply) return;
 
     if (req->body_len < 8) {
         const char *err = "invalid img body";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags = 0;
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
@@ -233,11 +241,11 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
     size_t pixels = (size_t)w * (size_t)h;
     if (req->body_len != 8 + pixels || pixels > MAX_IMG_PIXELS) {
         const char *err = "size mismatch";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags = 0;
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
@@ -246,28 +254,28 @@ static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
     job_t *job = NULL;
     if (submit_unsharp_job(w, h, in_pixels, &job) < 0) {
         const char *err = "job submit failed";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags = 0;
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
 
     if (wait_unsharp_and_build_reply(job, req, reply) < 0) {
         const char *err = "job wait failed";
-        reply->opcode = OPCODE_ERROR;
-        reply->flags = 0;
+        reply->opcode   = OPCODE_ERROR;
+        reply->flags    = 0;
         reply->reserved = 0;
         reply->body_len = strlen(err);
-        reply->body = (uint8_t *)malloc(reply->body_len);
+        reply->body     = (uint8_t *)malloc(reply->body_len);
         if (reply->body) memcpy(reply->body, err, reply->body_len);
         return;
     }
 }
 
-/* ========= handle_connection / worker_loop (TLS 版) ========= */
+/* ========= handle_connection / worker_loop (TLS version) ========= */
 
 static void handle_connection(tls_ctx_t *t) {
     if (!t) return;
@@ -326,18 +334,18 @@ static void handle_connection(tls_ctx_t *t) {
         if (msg.opcode == OPCODE_IMG_REQUEST) {
             process_image_request(&msg, &reply);
         } else if (msg.opcode == OPCODE_HEARTBEAT) {
-            reply.opcode = OPCODE_HEARTBEAT;
-            reply.flags = 0;
+            reply.opcode   = OPCODE_HEARTBEAT;
+            reply.flags    = 0;
             reply.reserved = 0;
-            reply.body = NULL;
+            reply.body     = NULL;
             reply.body_len = 0;
         } else {
             const char *err = "unknown opcode";
-            reply.opcode = OPCODE_ERROR;
-            reply.flags = 0;
+            reply.opcode   = OPCODE_ERROR;
+            reply.flags    = 0;
             reply.reserved = 0;
             reply.body_len = strlen(err);
-            reply.body = (uint8_t *)malloc(reply.body_len);
+            reply.body     = (uint8_t *)malloc(reply.body_len);
             if (reply.body) memcpy(reply.body, err, reply.body_len);
         }
 
@@ -395,11 +403,10 @@ static void worker_loop(int listen_fd) {
 
         LOG_INFO("worker %d accepted connection fd=%d", getpid(), conn_fd);
 
-        // 這裡包 TLS：共用全域的 g_tls_server context
         tls_ctx_t *t = tls_server_wrap_fd(&g_tls_server, conn_fd);
         if (!t) {
             LOG_WARN("tls_server_wrap_fd failed fd=%d", conn_fd);
-            net_close(conn_fd); // TLS 失敗時直接關 TCP
+            net_close(conn_fd);
             continue;
         }
 
@@ -409,7 +416,7 @@ static void worker_loop(int listen_fd) {
     LOG_INFO("worker %d exit", getpid());
 }
 
-/* ========= main：多一個 unsharp process + TLS 初始化 ========= */
+/* ========= main: add unsharp process + TLS initialization ========= */
 
 int main(int argc, char *argv[]) {
     const char *ip = NULL;
@@ -426,7 +433,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 初始化 OpenSSL & TLS server context
     tls_global_init();
     if (tls_server_init(&g_tls_server, "server.crt", "server.key") < 0) {
         LOG_ERROR("tls_server_init failed");
@@ -447,14 +453,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 初始化 job 狀態
+    // Initialize job states
     ipc_lock(&g_ipc);
     for (int i = 0; i < MAX_JOBS; ++i) {
-        STATS->jobs[i].state = JOB_EMPTY;
+        STATS->jobs[i].state     = JOB_EMPTY;
+        STATS->jobs[i].owner_pid = 0;
     }
     ipc_unlock(&g_ipc);
 
-    // --- 記錄 child PID ---
     pid_t unsharp_pid = -1;
     pid_t *worker_pids = calloc(workers, sizeof(pid_t));
     if (!worker_pids) {
@@ -465,10 +471,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 先 fork 出 unsharp process
+    // Fork unsharp process first
     unsharp_pid = fork();
     if (unsharp_pid == 0) {
-        // child: unsharp
         close(listen_fd);
         unsharp_loop();
         exit(0);
@@ -481,27 +486,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 再 fork 多個 worker
+    // Then fork multiple workers
     for (int i = 0; i < workers; ++i) {
         pid_t pid = fork();
         if (pid == 0) {
-            // child: worker
             worker_loop(listen_fd);
             close(listen_fd);
             exit(0);
         } else if (pid < 0) {
             LOG_ERROR("fork worker %d failed", i);
-            // 簡化處理：master 先繼續跑，少一個 worker
             worker_pids[i] = -1;
         } else {
             worker_pids[i] = pid;
         }
     }
 
-    // master 不用 listen 的 accept，但保留 listen_fd 給子行程用
-    // --- master main loop: 偵測 shutdown_flag + 重生 child ---
+    // --- master main loop: monitor shutdown_flag + respawn children ---
     while (1) {
-        // 1) 檢查 shutdown_flag
         ipc_lock(&g_ipc);
         int shutdown = STATS->shutdown_flag;
         ipc_unlock(&g_ipc);
@@ -510,14 +511,24 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // 2) 用 waitpid(WNOHANG) 看看有沒有 child 掛掉
         int status;
         pid_t pid;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            // 查看是誰掛了
             if (pid == unsharp_pid) {
                 LOG_WARN("unsharp process %d exited unexpectedly", pid);
-                // 如果還沒 shutdown，就重啟 unsharp
+
+                // *** Reschedule the BUSY jobs handled by this unsharp process.
+                ipc_lock(&g_ipc);
+                for (int i = 0; i < MAX_JOBS; ++i) {
+                    job_t *job = &STATS->jobs[i];
+                    if (job->state == JOB_BUSY && job->owner_pid == pid) {
+                        LOG_WARN("requeue job idx=%d owned by dead unsharp %d", i, pid);
+                        job->state     = JOB_READY;
+                        job->owner_pid = 0;
+                    }
+                }
+                ipc_unlock(&g_ipc);
+
                 ipc_lock(&g_ipc);
                 shutdown = STATS->shutdown_flag;
                 ipc_unlock(&g_ipc);
@@ -535,7 +546,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else {
-                // 看是不是某個 worker
+                // Restart the worker when it crashes.
                 for (int i = 0; i < workers; ++i) {
                     if (worker_pids[i] == pid) {
                         LOG_WARN("worker %d (pid=%d) exited", i, pid);
@@ -543,7 +554,6 @@ int main(int argc, char *argv[]) {
                         shutdown = STATS->shutdown_flag;
                         ipc_unlock(&g_ipc);
                         if (!shutdown) {
-                            // 重啟一個新的 worker
                             pid_t npid = fork();
                             if (npid == 0) {
                                 worker_loop(listen_fd);
@@ -562,16 +572,13 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // 稍微睡一下，避免 busy loop
         sleep(1);
     }
 
-    // --- 進入 shutdown：不再重生 child，等他們自然結束 ---
+    // --- shutdown phase ---
     close(listen_fd);
     int status2;
-    while (waitpid(-1, &status2, 0) > 0) {
-        // 把所有 child 收乾淨
-    }
+    while (waitpid(-1, &status2, 0) > 0) { }
 
     free(worker_pids);
     tls_server_free(&g_tls_server);

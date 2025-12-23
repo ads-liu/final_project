@@ -29,7 +29,7 @@ typedef struct {
     int requests_per_thread;
     stats_t *stats;
     int thread_index;
-    uint8_t *img_body;   // 共用的 lena 請求 body
+    uint8_t *img_body;   // Shared lena request body
     size_t body_len;
 } thread_arg_t;
 
@@ -45,7 +45,7 @@ static double now_ms(void) {
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
-/* 確保有 img 資料夾 */
+/* Ensure the img directory exists */
 static void ensure_img_dir(void) {
     struct stat st;
     if (stat("img", &st) == -1) {
@@ -53,7 +53,7 @@ static void ensure_img_dir(void) {
     }
 }
 
-/* 儲存 8-bit 灰階像素為 PGM (P5) 檔 */
+/* Save 8-bit grayscale pixels as PGM (P5) file */
 static void save_pgm(const char *path, const uint8_t *pixels,
                      uint32_t w, uint32_t h) {
     FILE *fp = fopen(path, "wb");
@@ -63,7 +63,7 @@ static void save_pgm(const char *path, const uint8_t *pixels,
     fclose(fp);
 }
 
-/* 產生日期字串 YYYYMMDD */
+/* Generate date string YYYYMMDD */
 static void make_date_prefix(char *buf, size_t sz) {
     time_t t = time(NULL);
     struct tm tmv;
@@ -71,7 +71,7 @@ static void make_date_prefix(char *buf, size_t sz) {
     strftime(buf, sz, "%Y%m%d", &tmv);
 }
 
-/* 讀取 P5 8-bit PGM 檔 (lena.pgm) */
+/* Load P5 8-bit PGM file (lena.pgm) */
 static int load_pgm(const char *path, pgm_img_t *img) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -87,7 +87,7 @@ static int load_pgm(const char *path, pgm_img_t *img) {
     }
 
     int c = fgetc(fp);
-    while (c == '#') {              // 跳過註解行
+    while (c == '#') {              // Skip comment lines
         while (c != '\n' && c != EOF) c = fgetc(fp);
         c = fgetc(fp);
     }
@@ -110,7 +110,7 @@ static int load_pgm(const char *path, pgm_img_t *img) {
         return -1;
     }
 
-    fgetc(fp); // 吃掉 header 後面的單一 whitespace
+    fgetc(fp); // Consume the single whitespace after header
 
     size_t pixels = (size_t)w * (size_t)h;
     uint8_t *buf = (uint8_t *)malloc(pixels);
@@ -137,15 +137,15 @@ static int load_pgm(const char *path, pgm_img_t *img) {
 static void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
 
-    /* 1) 先建立 TCP 連線 */
+    /* 1) Establish TCP connection first */
     int fd = net_connect(targ->ip, targ->port);
     if (fd < 0) {
         LOG_ERROR("thread %d connect failed", targ->thread_index);
         return NULL;
     }
 
-    /* 2) 包成 TLS：使用 server.crt 當 CA，驗證伺服器憑證與主機名 */
-    extern tls_client_t g_tls_client;   // 在 main 裡定義全域 client context
+    /* 2) Wrap into TLS: use server.crt as CA, verify server certificate and hostname */
+    extern tls_client_t g_tls_client;   // Global client context defined in main
     tls_ctx_t *t = tls_client_wrap_fd(&g_tls_client, fd, targ->ip);
     if (!t) {
         LOG_ERROR("thread %d TLS handshake failed", targ->thread_index);
@@ -164,7 +164,7 @@ static void *worker_thread(void *arg) {
     w_host = ntohl(w_host);
     h_host = ntohl(h_host);
 
-    int saved_once = 0; // 每個 thread 只存一次回傳影像
+    int saved_once = 0; // Each thread saves returned image only once
 
     for (int i = 0; i < targ->requests_per_thread; ++i) {
         proto_msg_t msg;
@@ -243,7 +243,7 @@ static void *worker_thread(void *arg) {
         }
         pthread_mutex_unlock(&targ->stats->lock);
 
-        /* 每個 thread 第一次成功回應時，把圖片存成 img/YYYYMMDD_threadX_lena.pgm */
+        /* On first successful response in each thread, save image as img/YYYYMMDD_threadX_lena.pgm */
         if (reply.opcode == OPCODE_IMG_RESPONSE && !saved_once) {
             if (reply.body_len >= 8) {
                 uint32_t w_net2, h_net2;
@@ -276,18 +276,18 @@ static void *worker_thread(void *arg) {
         free(in_buf);
     }
 
-    tls_close(t);  // 會順便 close(fd)
+    tls_close(t);  // This also closes fd
     return NULL;
 }
 
-/* 全域 TLS client context，所有 thread 共用同一個 SSL_CTX */
+/* Global TLS client context, all threads share the same SSL_CTX */
 tls_client_t g_tls_client;
 
 int main(int argc, char *argv[]) {
     const char *ip = "127.0.0.1";
     uint16_t port = 9000;
     int threads = 1;
-    int req_per_thread = 1;  // 一個 thread 送幾次，可自行調整
+    int req_per_thread = 1;  // How many requests each thread sends, adjustable
 
     if (argc > 1) ip = argv[1];
     if (argc > 2) port = (uint16_t)atoi(argv[2]);
@@ -295,16 +295,16 @@ int main(int argc, char *argv[]) {
     if (argc > 4) req_per_thread = atoi(argv[4]);
 
     log_init(NULL, LOG_LEVEL_INFO);
-    ensure_img_dir();  // 確保有 img 資料夾
+    ensure_img_dir();  // Ensure the img directory exists
 
-    /* 初始化 TLS：使用 server.crt 當信任 CA，開啟伺服器憑證驗證 */
+    /* Initialize TLS: use server.crt as trusted CA, enable server certificate verification */
     tls_global_init();
     if (tls_client_init(&g_tls_client, "server.crt") < 0) {
         fprintf(stderr, "tls_client_init failed\n");
         return 1;
     }
 
-    /* 載入 lena.pgm，組成協定 body */
+    /* Load lena.pgm and assemble protocol body */
     pgm_img_t lena;
     if (load_pgm("lena.pgm", &lena) < 0) {
         fprintf(stderr, "load lena.pgm failed\n");

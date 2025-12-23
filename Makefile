@@ -14,64 +14,64 @@ LIBS    := $(LIBDIR)/libnet.a \
 all: dirs $(LIBS) server client
 
 dirs:
-	mkdir -p $(LIBDIR)
+	 mkdir -p $(LIBDIR)
 
 # ---- libnet.a ----
 $(LIBDIR)/libnet.a: $(SRCDIR)/net.o
-	ar rcs $@ $^
+	 ar rcs $@ $^
 
 $(SRCDIR)/net.o: $(SRCDIR)/net.c include/net.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 # ---- libproto.a ----
 $(LIBDIR)/libproto.a: $(SRCDIR)/proto.o
-	ar rcs $@ $^
+	 ar rcs $@ $^
 
 $(SRCDIR)/proto.o: $(SRCDIR)/proto.c include/proto.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 # ---- libipc.a ----
 $(LIBDIR)/libipc.a: $(SRCDIR)/ipc.o
-	ar rcs $@ $^
+	 ar rcs $@ $^
 
 $(SRCDIR)/ipc.o: $(SRCDIR)/ipc.c include/ipc.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 # ---- liblog.a ----
 $(LIBDIR)/liblog.a: $(SRCDIR)/log.o
-	ar rcs $@ $^
+	 ar rcs $@ $^
 
 $(SRCDIR)/log.o: $(SRCDIR)/log.c include/log.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
-# ---- libtls.a (新增加的 TLS 函式庫) ----
+# ---- libtls.a (Newly added TLS library) ----
 $(LIBDIR)/libtls.a: $(SRCDIR)/tls.o
-	ar rcs $@ $^
+	 ar rcs $@ $^
 
 $(SRCDIR)/tls.o: $(SRCDIR)/tls.c include/tls.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 # ---- server / client ----
 
 server: $(SRCDIR)/server.o $(LIBS)
-	$(CC) $(CFLAGS) $< -L$(LIBDIR) -lnet -lproto -lipc -llog -ltls -lssl -lcrypto $(LDFLAGS) -o $@
+	 $(CC) $(CFLAGS) $< -L$(LIBDIR) -lnet -lproto -lipc -llog -ltls -lssl -lcrypto $(LDFLAGS) -o $@
 
 $(SRCDIR)/server.o: $(SRCDIR)/server.c \
                     include/net.h include/proto.h include/ipc.h \
                     include/log.h include/tls.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 client: $(SRCDIR)/client.o $(LIBS)
-	$(CC) $(CFLAGS) $< -L$(LIBDIR) -lnet -lproto -llog -ltls -lssl -lcrypto $(LDFLAGS) -o $@
+	 $(CC) $(CFLAGS) $< -L$(LIBDIR) -lnet -lproto -llog -ltls -lssl -lcrypto $(LDFLAGS) -o $@
 
 $(SRCDIR)/client.o: $(SRCDIR)/client.c \
                     include/net.h include/proto.h include/log.h \
                     include/tls.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	 $(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(SRCDIR)/*.o
-	rm -f $(LIBDIR)/*.a
-	rm -f server client
+	 rm -f $(SRCDIR)/*.o
+	 rm -f $(LIBDIR)/*.a
+	 rm -f server client
 
 .PHONY: all clean dirs
