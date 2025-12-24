@@ -100,12 +100,12 @@ static void unsharp_loop(void) {
         int found = 0;
         job_t *job = NULL;
 
-        // 找 READY job，改成 BUSY 並填 owner_pid
+        // Find a READY job, mark it BUSY and set owner_pid
         for (int i = 0; i < MAX_JOBS; ++i) {
             job_t *j = &STATS->jobs[i];
             if (j->state == JOB_READY) {
-                j->state     = JOB_BUSY;   // *** 修改點：明確用 JOB_BUSY
-                j->owner_pid = mypid;      // *** 修改點：記錄是哪一隻 unsharp 在算
+                j->state     = JOB_BUSY;   // Mark as JOB_BUSY
+                j->owner_pid = mypid;      // Record which unsharp process is handling it
                 job = j;
                 found = 1;
                 break;
@@ -118,13 +118,13 @@ static void unsharp_loop(void) {
             continue;
         }
 
-        // 真正做 unsharp
+        // Perform unsharp processing
         do_unsharp_job(job);
 
-        // 寫回 DONE
+        // Write back as DONE
         ipc_lock(&g_ipc);
         job->state = JOB_DONE;
-        // job->owner_pid 可留著做 debug，需要也可以清成 0
+        // owner_pid can stay for debugging; clear to 0 if needed
         ipc_unlock(&g_ipc);
     }
 
@@ -164,7 +164,7 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
             job->pixels = pixels;
             memcpy(job->input, in_pixels, pixels);
             job->state     = JOB_READY;
-            job->owner_pid = 0;   // *** 建議：提交時先清為 0
+            job->owner_pid = 0;   // Clear owner before submission
             *ret_job = job;
             ipc_unlock(&g_ipc);
             return 0;
@@ -175,7 +175,7 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
     }
 }
 
-// Wait for job to become DONE, then copy output to reply body (including w,h header)
+// Wait for job to finish (DONE), then build reply body (including w, h header)
 static int wait_unsharp_and_build_reply(job_t *job,
                                         const proto_msg_t *req,
                                         proto_msg_t *reply) {
@@ -207,7 +207,7 @@ static int wait_unsharp_and_build_reply(job_t *job,
 
     ipc_lock(&g_ipc);
     job->state     = JOB_EMPTY;
-    job->owner_pid = 0;   // *** 清 owner
+    job->owner_pid = 0;   // Clear owner
     ipc_unlock(&g_ipc);
 
     reply->opcode   = OPCODE_IMG_RESPONSE;
@@ -218,7 +218,7 @@ static int wait_unsharp_and_build_reply(job_t *job,
     return 0;
 }
 
-// Parse body, submit job to unsharp process, then fetch the result
+// Parse body, submit a job to the unsharp process, then retrieve the result
 static void process_image_request(const proto_msg_t *req, proto_msg_t *reply) {
     if (!req || !reply) return;
 
@@ -453,7 +453,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Initialize job states
+    // Initialize all job slots
     ipc_lock(&g_ipc);
     for (int i = 0; i < MAX_JOBS; ++i) {
         STATS->jobs[i].state     = JOB_EMPTY;
@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Then fork multiple workers
+    // Then fork multiple worker processes
     for (int i = 0; i < workers; ++i) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -501,7 +501,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // --- master main loop: monitor shutdown_flag + respawn children ---
+    // --- master main loop: monitor shutdown_flag and respawn children ---
     while (1) {
         ipc_lock(&g_ipc);
         int shutdown = STATS->shutdown_flag;
@@ -517,7 +517,7 @@ int main(int argc, char *argv[]) {
             if (pid == unsharp_pid) {
                 LOG_WARN("unsharp process %d exited unexpectedly", pid);
 
-                // *** Reschedule the BUSY jobs handled by this unsharp process.
+                // Reschedule BUSY jobs handled by the dead unsharp process
                 ipc_lock(&g_ipc);
                 for (int i = 0; i < MAX_JOBS; ++i) {
                     job_t *job = &STATS->jobs[i];
@@ -546,7 +546,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else {
-                // Restart the worker when it crashes.
+                // Restart a worker if it crashes
                 for (int i = 0; i < workers; ++i) {
                     if (worker_pids[i] == pid) {
                         LOG_WARN("worker %d (pid=%d) exited", i, pid);

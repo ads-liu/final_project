@@ -20,8 +20,4 @@ int net_connect(const char *ip, uint16_t port);
 // Close a socket
 void net_close(int fd);
 
-// Reliably read/write exactly n bytes (handles short read/write), return 0 on success, -1 on error
-int net_read_n(int fd, void *buf, size_t n);
-int net_write_n(int fd, const void *buf, size_t n);
-
 #endif // NET_H
