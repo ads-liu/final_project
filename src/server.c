@@ -87,8 +87,8 @@ static void do_unsharp_job(job_t *job) {
 }
 
 static void unsharp_loop(void) {
-    pid_t mypid = getpid();
-    LOG_INFO("unsharp process %d started", mypid);
+
+    LOG_INFO("unsharp process %d started", getpid());
 
     while (1) {
         ipc_lock(&g_ipc);
@@ -100,12 +100,11 @@ static void unsharp_loop(void) {
         int found = 0;
         job_t *job = NULL;
 
-        // Find a READY job, mark it BUSY and set owner_pid
+        // Find a READY job, mark it BUSY
         for (int i = 0; i < MAX_JOBS; ++i) {
             job_t *j = &STATS->jobs[i];
             if (j->state == JOB_READY) {
-                j->state     = JOB_BUSY;   // Mark as JOB_BUSY
-                j->owner_pid = mypid;      // Record which unsharp process is handling it
+                j->state = JOB_BUSY;   // Mark as JOB_BUSY
                 job = j;
                 found = 1;
                 break;
@@ -124,11 +123,10 @@ static void unsharp_loop(void) {
         // Write back as DONE
         ipc_lock(&g_ipc);
         job->state = JOB_DONE;
-        // owner_pid can stay for debugging; clear to 0 if needed
         ipc_unlock(&g_ipc);
     }
 
-    LOG_INFO("unsharp process %d exit", mypid);
+    LOG_INFO("unsharp process %d exit", getpid());
 }
 
 /* ========= Worker side: submit jobs to unsharp process ========= */
@@ -164,7 +162,7 @@ static int submit_unsharp_job(uint32_t w, uint32_t h,
             job->pixels = pixels;
             memcpy(job->input, in_pixels, pixels);
             job->state     = JOB_READY;
-            job->owner_pid = 0;   // Clear owner before submission
+            job->owner_pid = getpid(); 
             *ret_job = job;
             ipc_unlock(&g_ipc);
             return 0;
@@ -521,7 +519,7 @@ int main(int argc, char *argv[]) {
                 ipc_lock(&g_ipc);
                 for (int i = 0; i < MAX_JOBS; ++i) {
                     job_t *job = &STATS->jobs[i];
-                    if (job->state == JOB_BUSY && job->owner_pid == pid) {
+                    if (job->state == JOB_BUSY) {
                         LOG_WARN("requeue job idx=%d owned by dead unsharp %d", i, pid);
                         job->state     = JOB_READY;
                         job->owner_pid = 0;
@@ -550,6 +548,17 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < workers; ++i) {
                     if (worker_pids[i] == pid) {
                         LOG_WARN("worker %d (pid=%d) exited", i, pid);
+                        // Reschedule BUSY jobs handled by the dead unsharp process
+                        ipc_lock(&g_ipc);
+                        for (int i = 0; i < MAX_JOBS; ++i) {
+                            job_t *job = &STATS->jobs[i];
+                            if (job->owner_pid == pid) {
+                                LOG_WARN("requeue job idx=%d owned by dead worker %d", i, pid);
+                                job->state     = JOB_EMPTY;
+                                job->owner_pid = 0;
+                            }
+                        }
+                        ipc_unlock(&g_ipc);
                         ipc_lock(&g_ipc);
                         shutdown = STATS->shutdown_flag;
                         ipc_unlock(&g_ipc);
