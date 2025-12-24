@@ -87,23 +87,7 @@ Client 會讀取本地的 `lena.pgm` (8-bit P5)，透過自訂二進位協定送
 
 以下假設使用 gcc 與 OpenSSL 開發套件（含 header 與 lib）。
 
-### 直接用 gcc（範例）
-
-```bash
-gcc -Wall -O2 -pthread \
-    server.c ipc.c net.c proto.c log.c tls.c \
-    -o server \
-    -lssl -lcrypto
-
-gcc -Wall -O2 -pthread \
-    client.c net.c proto.c log.c tls.c \
-    -o client \
-    -lssl -lcrypto
-```
-
-實際檔名請依你的檔案命名調整（例如 `server.c` / `client.c`）。
-
-### 使用 Makefile（建議）
+### 使用 Makefile
 
 ```makefile
 CC = gcc
@@ -190,3 +174,9 @@ openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
 
 - 先對輸入影像套用 3x3 box blur（邊界採用 valid 邊界檢查，實際計算時只平均落在影像內的像素）。
 - 之後使用：`output = orig + k * (orig - blur)`，其中 `k = 8.0`，最後 clamp 到 。
+
+| 成員 | 負責模組 / 功能 | 主要檔案 | 備註 |
+|------|-----------------|----------|------|
+| 成員 A |                 |          |      |
+| 成員 B |                 |          |      |
+| 成員 C |                 |          |      |
