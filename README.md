@@ -175,8 +175,8 @@ openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
 - 先對輸入影像套用 3x3 box blur（邊界採用 valid 邊界檢查，實際計算時只平均落在影像內的像素）。
 - 之後使用：`output = orig + k * (orig - blur)`，其中 `k = 8.0`，最後 clamp 到 。
 
-| 成員 | 負責模組 / 功能 | 主要檔案 | 備註 |
-|------|-----------------|----------|------|
-| 成員 A |                 |          |      |
-| 成員 B |                 |          |      |
-| 成員 C |                 |          |      |
+| 成員 | 主要檔案 |
+|------|----------|
+| 劉康琳 | Makefile、tls、net |      
+| 王力平 | ipc、proto、log |
+| 黃韋倫 | server、client |
